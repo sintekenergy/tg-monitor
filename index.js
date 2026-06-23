@@ -10,7 +10,7 @@ const API_HASH = 'b18441a1ff607e10a989891a5462e627'
 
 const YOUR_PHONE = '+79248287898'
 const BOT_TOKEN_CHAT_ID = 8651432575
-const BOT_TOKEN = '8664720856:AAHJ-Bo7COT-Zalw0ZElQILQjiJJ356H_wY'
+const BOT_TOKEN = '8664720856:AAHJ-Bo7COT-Zalw0ZElQiIJJ356H_wY'
 
 const SUPA_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://mpyphadcrdvmxnjyhorg.supabase.co'
 const SUPA_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1weXBoYWRjcmR2bXhuanlob3JnIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MjAyODM5MywiZXhwIjoyMDk3NjA0MzkzfQ.iExYvEpqVj9HeiNdrk8GfeaWRxw3wczYrdcXgJvFY9o'
@@ -26,7 +26,10 @@ function loadSession() {
 
 async function supaFetch(path) {
   const r = await fetch(`${SUPA_URL}/rest/v1/${path}`, {
-    headers: { 'apikey': SUPA_KEY, 'Authorization': `Bearer ${SUPA_KEY}` },
+    headers: {
+      'apikey': SUPA_KEY,
+      'Authorization': `Bearer ${SUPA_KEY}`,
+    },
   })
   return r.json()
 }
@@ -55,7 +58,12 @@ async function createLead(ownerID, displayName, telegramUsername, equipmentDescr
   })
   const r = await fetch(`${SUPA_URL}/rest/v1/leads`, {
     method: 'POST',
-    headers: { 'apikey': SUPA_KEY, 'Authorization': `Bearer ${SUPA_KEY}`, 'Content-Type': 'application/json', 'Prefer': 'return=representation' },
+    headers: {
+      'apikey': SUPA_KEY,
+      'Authorization': `Bearer ${SUPA_KEY}`,
+      'Content-Type': 'application/json',
+      'Prefer': 'return=representation',
+    },
     body,
   })
   const data = await r.json()
@@ -67,12 +75,14 @@ async function getOwnerAndSettings() {
   const ownerID = profiles[0]?.id
   if (!ownerID) return null
 
-  const [groupsData, modelsData] = await Promise.all([
-    supaFetch(`monitor_groups?select=username&owner_id=eq.${ownerID}&active=eq.true`),
+  const [sourcesData, modelsData] = await Promise.all([
+    supaFetch(`sources?select=url&owner_id=eq.${ownerID}&source_type=eq.telegram_channel&monitor_enabled=eq.true`),
     supaFetch(`equipment_models?select=model_name&owner_id=eq.${ownerID}&active=eq.true`),
   ])
 
-  const groups = Array.isArray(groupsData) ? groupsData.map(g => g.username) : []
+  const groups = Array.isArray(sourcesData)
+    ? sourcesData.map(s => s.url.replace('https://t.me/', '').replace('https://telegram.me/', '')).filter(Boolean)
+    : []
   const models = Array.isArray(modelsData) ? modelsData.map(m => m.model_name.toLowerCase()) : []
 
   return { ownerID, groups, models }
@@ -81,20 +91,26 @@ async function getOwnerAndSettings() {
 async function main() {
   const sessionString = loadSession()
 
-  const client = new TelegramClient(new StringSession(sessionString), API_ID, API_HASH, { connectionRetries: 5 })
+  const client = new TelegramClient(
+    new StringSession(sessionString),
+    API_ID,
+    API_HASH,
+    { connectionRetries: 5 }
+  )
 
   await client.start({
     phoneNumber: async () => YOUR_PHONE,
-    password: async () => await input.text('Введи пароль 2FA: '),
+    password: async () => await input.text('Введи пароль 2FA (если есть, иначе Enter): '),
     phoneCode: async () => await input.text('Введи код из Telegram: '),
     onError: (err) => console.log('Ошибка:', err),
   })
 
-  fs.writeFileSync(SESSION_FILE, client.session.save())
-  console.log('✅ Авторизован!')
+  const session = client.session.save()
+  fs.writeFileSync(SESSION_FILE, session)
+  console.log('✅ Авторизован! Сессия сохранена.')
 
   let settings = await getOwnerAndSettings()
-  console.log(`👁 Мониторинг запущен. Групп: ${settings?.groups?.length ?? 0}, Моделей: ${settings?.models?.length ?? 0}`)
+  console.log(`👁 Мониторинг запущен... Групп: ${settings?.groups?.length ?? 0}, Моделей: ${settings?.models?.length ?? 0}`)
   sendNotification(`✅ Мониторинг запущен.\nГрупп: ${settings?.groups?.length ?? 0}, Моделей: ${settings?.models?.length ?? 0}`)
 
   setInterval(async () => {
@@ -106,9 +122,13 @@ async function main() {
     const message = event.message
     if (!message?.text) return
 
-    const lower = message.text.toLowerCase()
+    const text = message.text
+    const lower = text.toLowerCase()
+
     const models = settings?.models ?? []
-    if (!models.length || !models.some(m => lower.includes(m))) return
+    if (models.length === 0) return
+    const matched = models.some(m => lower.includes(m))
+    if (!matched) return
 
     try {
       const sender = await message.getSender()
@@ -120,13 +140,25 @@ async function main() {
 
       let leadId = null
       if (settings?.ownerID) {
-        const lead = await createLead(settings.ownerID, sender?.username ?? sender?.firstName ?? 'неизвестен', sender?.username ? `@${sender.username}` : null, message.text.slice(0, 500))
+        const lead = await createLead(
+          settings.ownerID,
+          sender?.username ?? sender?.firstName ?? 'неизвестен',
+          sender?.username ? `@${sender.username}` : null,
+          text.slice(0, 500)
+        )
         leadId = lead?.id?.slice(0, 8)
       }
 
-      sendNotification(`🔔 <b>Новый продавец!</b>\n\n👤 ${username}\n💬 ${chatTitle}\n\n📝 ${message.text.slice(0, 400)}\n\n${leadId ? `✅ Лид создан: /черновик ${leadId}` : ''}`)
+      const notification =
+        `🔔 <b>Новый продавец майнера!</b>\n\n` +
+        `👤 ${username}\n` +
+        `💬 ${chatTitle}\n\n` +
+        `📝 ${text.slice(0, 400)}\n\n` +
+        (leadId ? `✅ Лид создан: /черновик ${leadId}` : '')
+
+      sendNotification(notification)
     } catch (e) {
-      console.error('Ошибка:', e.message)
+      console.error('Ошибка обработки:', e.message)
     }
   }, new NewMessage({}))
 
