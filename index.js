@@ -8,15 +8,12 @@ const fs = require('fs')
 
 const API_ID = 2040
 const API_HASH = 'b18441a1ff607e10a989891a5462e627'
-
 const YOUR_PHONE = '+79248287898'
 const BOT_TOKEN_CHAT_ID = 8651432575
 const BOT_TOKEN = '8664720856:AAHJ-Bo7COT-Zalw0ZElQiIJJ356H_wY'
-
 const SUPA_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || 'https://mpyphadcrdvmxnjyhorg.supabase.co'
 const SUPA_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1weXBoYWRjcmR2bXhuanlob3JnIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4MjAyODM5MywiZXhwIjoyMDk3NjA0MzkzfQ.iExYvEpqVj9HeiNdrk8GfeaWRxw3wczYrdcXgJvFY9o'
 const TG_USER_ID = 8651432575
-
 const SESSION_FILE = './session.txt'
 
 function loadSession() {
@@ -52,15 +49,13 @@ async function createLead(ownerID, displayName, telegramUsername, equipmentDescr
     telegram_username: telegramUsername || null,
     equipment_description: equipmentDescription?.slice(0, 500) || null,
     status: 'new',
-    external_profile: 'авто-мониторинг',
+    external_profile: 'auto-monitor',
   })
   const r = await fetch(`${SUPA_URL}/rest/v1/leads`, {
     method: 'POST',
     headers: {
-      'apikey': SUPA_KEY,
-      'Authorization': `Bearer ${SUPA_KEY}`,
-      'Content-Type': 'application/json',
-      'Prefer': 'return=representation',
+      'apikey': SUPA_KEY, 'Authorization': `Bearer ${SUPA_KEY}`,
+      'Content-Type': 'application/json', 'Prefer': 'return=representation',
     },
     body,
   })
@@ -86,22 +81,18 @@ async function getOwnerAndSettings() {
 function startHttpServer(getClient) {
   const PORT = process.env.PORT || 3001
   const SECRET = process.env.PREVIEW_SECRET || 'zemobmen-preview'
-
   const server = http.createServer(async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*')
     res.setHeader('Content-Type', 'application/json')
-
     if (req.method === 'GET' && req.url === '/health') {
       res.writeHead(200)
       return res.end(JSON.stringify({ ok: true }))
     }
-
     const auth = req.headers['authorization']
     if (auth !== `Bearer ${SECRET}`) {
       res.writeHead(401)
       return res.end(JSON.stringify({ error: 'Unauthorized' }))
     }
-
     const match = req.url.match(/^\/messages\/([A-Za-z0-9_]+)(\?.*)?$/)
     if (req.method === 'GET' && match) {
       const client = getClient()
@@ -115,10 +106,7 @@ function startHttpServer(getClient) {
       try {
         const msgs = await client.getMessages(username, { limit })
         const result = msgs.map(m => ({
-          id: m.id,
-          text: m.message || '',
-          date: m.date,
-          views: m.views || null,
+          id: m.id, text: m.message || '', date: m.date, views: m.views || null,
           has_photo: !!(m.media && m.media.className === 'MessageMediaPhoto'),
           has_video: !!(m.media && (m.media.className === 'MessageMediaDocument' || m.media.className === 'MessageMediaVideo')),
           url: `https://t.me/${username}/${m.id}`,
@@ -130,68 +118,51 @@ function startHttpServer(getClient) {
         return res.end(JSON.stringify({ error: e.message }))
       }
     }
-
     res.writeHead(404)
     res.end(JSON.stringify({ error: 'Not found' }))
   })
-
-  server.listen(PORT, () => {
-    console.log(`HTTP server started on port ${PORT}`)
-  })
+  server.listen(PORT, () => console.log(`HTTP server on port ${PORT}`))
 }
 
-async function connectTelegram(client) {
+async function connectTelegram(sessionString) {
   for (let attempt = 1; ; attempt++) {
+    const client = new TelegramClient(
+      new StringSession(sessionString), API_ID, API_HASH, { connectionRetries: 1 }
+    )
     try {
-      await client.start({
+      const started = client.start({
         phoneNumber: async () => YOUR_PHONE,
-        password: async () => await input.text('2FA password: '),
-        phoneCode: async () => await input.text('Phone code: '),
+        password: async () => await input.text('2FA: '),
+        phoneCode: async () => await input.text('Code: '),
         onError: (err) => console.log('TG error:', err.message),
       })
-      console.log('Telegram connected on attempt', attempt)
-      return true
+      const timer = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 40000))
+      await Promise.race([started, timer])
+      console.log(`Telegram connected on attempt ${attempt}`)
+      return client
     } catch (err) {
-      const delay = Math.min(15000 * attempt, 120000)
+      const delay = Math.min(20000 * attempt, 120000)
       console.error(`Attempt ${attempt} failed: ${err.message}. Retry in ${delay / 1000}s`)
+      try { await client.destroy() } catch (_) {}
       await new Promise(r => setTimeout(r, delay))
     }
   }
 }
 
-
 async function main() {
   const sessionString = loadSession()
-  const client = new TelegramClient(
-    new StringSession(sessionString),
-    API_ID,
-    API_HASH,
-    { connectionRetries: 5 }
-  )
+  const clientRef = { value: null }
+  startHttpServer(() => clientRef.value)
 
-  let connectedClient = null
-  startHttpServer(() => connectedClient)
-
-  const ok = await connectTelegram(client)
-  if (!ok) {
-    console.error('Failed to connect to Telegram. HTTP server stays alive.')
-    return
-  }
-
-  try {
-    const session = client.session.save()
-    fs.writeFileSync(SESSION_FILE, session)
-  } catch (_) {}
-
-  connectedClient = client
+  const client = await connectTelegram(sessionString)
+  try { fs.writeFileSync(SESSION_FILE, client.session.save()) } catch (_) {}
+  clientRef.value = client
 
   let settings = await getOwnerAndSettings()
   console.log(`Monitoring: groups=${settings?.groups?.length ?? 0}, models=${settings?.models?.length ?? 0}`)
-  sendNotification(`✅ Мониторинг запущен.\nГрупп: ${settings?.groups?.length ?? 0}, Моделей: ${settings?.models?.length ?? 0}`)
+  sendNotification(`Мониторинг запущен. Групп: ${settings?.groups?.length ?? 0}, Моделей: ${settings?.models?.length ?? 0}`)
 
-  setInterval(async () => {
-    settings = await getOwnerAndSettings()
-  }, 5 * 60 * 1000)
+  setInterval(async () => { settings = await getOwnerAndSettings() }, 5 * 60 * 1000)
 
   client.addEventHandler(async (event) => {
     const message = event.message
@@ -199,30 +170,27 @@ async function main() {
     const text = message.text
     const lower = text.toLowerCase()
     const models = settings?.models ?? []
-    if (models.length === 0) return
-    if (!models.some(m => lower.includes(m))) return
+    if (models.length === 0 || !models.some(m => lower.includes(m))) return
     try {
       const sender = await message.getSender()
       const chat = await message.getChat()
-      const username = sender?.username ? `@${sender.username}` : sender?.firstName ?? 'неизвестен'
-      const chatTitle = chat?.title ?? 'группа'
+      const username = sender?.username ? `@${sender.username}` : sender?.firstName ?? 'unknown'
+      const chatTitle = chat?.title ?? 'group'
       let leadId = null
       if (settings?.ownerID) {
         const lead = await createLead(
           settings.ownerID,
-          sender?.username ?? sender?.firstName ?? 'неизвестен',
+          sender?.username ?? sender?.firstName ?? 'unknown',
           sender?.username ? `@${sender.username}` : null,
           text.slice(0, 500)
         )
         leadId = lead?.id?.slice(0, 8)
       }
       sendNotification(
-        `🔔 <b>Новый продавец майнера!</b>\n\n👤 ${username}\n💬 ${chatTitle}\n\n📝 ${text.slice(0, 400)}\n\n` +
-        (leadId ? `✅ Лид создан: /черновик ${leadId}` : '')
+        `Новый продавец майнера!\n\n${username}\n${chatTitle}\n\n${text.slice(0, 400)}\n\n` +
+        (leadId ? `Лид создан: ${leadId}` : '')
       )
-    } catch (e) {
-      console.error('Handler error:', e.message)
-    }
+    } catch (e) { console.error('Handler error:', e.message) }
   }, new NewMessage({}))
 
   process.on('SIGINT', () => process.exit())
