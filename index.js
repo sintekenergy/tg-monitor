@@ -3,6 +3,7 @@ const { StringSession } = require('telegram/sessions')
 const { NewMessage } = require('telegram/events')
 const input = require('input')
 const https = require('https')
+const http = require('http')
 const fs = require('fs')
 
 const API_ID = 2040
@@ -88,6 +89,59 @@ async function getOwnerAndSettings() {
   return { ownerID, groups, models }
 }
 
+function startHttpServer(client) {
+  const PORT = process.env.PORT || 3001
+  const SECRET = process.env.PREVIEW_SECRET || 'zemobmen-preview'
+
+  const server = http.createServer(async (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*')
+    res.setHeader('Content-Type', 'application/json')
+
+    const auth = req.headers['authorization']
+    if (auth !== `Bearer ${SECRET}`) {
+      res.writeHead(401)
+      return res.end(JSON.stringify({ error: 'Unauthorized' }))
+    }
+
+    const match = req.url.match(/^\/messages\/([A-Za-z0-9_]+)(\?.*)?$/)
+    if (req.method === 'GET' && match) {
+      const username = match[1]
+      const limitMatch = (req.url || '').match(/limit=(\d+)/)
+      const limit = Math.min(parseInt(limitMatch?.[1] || '15', 10), 30)
+
+      try {
+        const msgs = await client.getMessages(username, { limit })
+        const result = msgs.map(m => ({
+          id: m.id,
+          text: m.message || '',
+          date: m.date,
+          views: m.views || null,
+          has_photo: !!(m.media && m.media.className === 'MessageMediaPhoto'),
+          has_video: !!(m.media && (m.media.className === 'MessageMediaDocument' || m.media.className === 'MessageMediaVideo')),
+          url: `https://t.me/${username}/${m.id}`,
+        }))
+        res.writeHead(200)
+        return res.end(JSON.stringify({ messages: result }))
+      } catch (e) {
+        res.writeHead(500)
+        return res.end(JSON.stringify({ error: e.message }))
+      }
+    }
+
+    if (req.method === 'GET' && req.url === '/health') {
+      res.writeHead(200)
+      return res.end(JSON.stringify({ ok: true }))
+    }
+
+    res.writeHead(404)
+    res.end(JSON.stringify({ error: 'Not found' }))
+  })
+
+  server.listen(PORT, () => {
+    console.log(`🌐 HTTP сервер запущен на порту ${PORT}`)
+  })
+}
+
 async function main() {
   const sessionString = loadSession()
 
@@ -108,6 +162,8 @@ async function main() {
   const session = client.session.save()
   fs.writeFileSync(SESSION_FILE, session)
   console.log('✅ Авторизован! Сессия сохранена.')
+
+  startHttpServer(client)
 
   let settings = await getOwnerAndSettings()
   console.log(`👁 Мониторинг запущен... Групп: ${settings?.groups?.length ?? 0}, Моделей: ${settings?.models?.length ?? 0}`)
