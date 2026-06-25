@@ -40,8 +40,8 @@ async function tryConnect(sessionString) {
   let done = false
   const startPromise = client.start({
     phoneNumber: async () => YOUR_PHONE,
-    password: async () => await input.text('2FA: '),
-    phoneCode: async () => await input.text('Code: '),
+    password: async () => { throw new Error('2FA_REQUIRED') },
+    phoneCode: async () => { throw new Error('PHONE_CODE_REQUIRED') },
     onError: (err) => console.log('TG error:', err.message),
   }).then(v => { done = true; return v }).catch(e => { done = true; throw e })
 
