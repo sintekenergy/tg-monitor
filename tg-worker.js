@@ -36,7 +36,7 @@ parentPort.on('message', async (msg) => {
 })
 
 async function tryConnect(sessionString) {
-  const client = new TelegramClient(new StringSession(sessionString), API_ID, API_HASH, { connectionRetries: 1 })
+  const client = new TelegramClient(new StringSession(sessionString), API_ID, API_HASH, { connectionRetries: 5, retryDelay: 3000, autoReconnect: false })
   let done = false
   const startPromise = client.start({
     phoneNumber: async () => YOUR_PHONE,
@@ -45,7 +45,7 @@ async function tryConnect(sessionString) {
     onError: (err) => console.log('TG error:', err.message),
   }).then(v => { done = true; return v }).catch(e => { done = true; throw e })
 
-  const deadline = Date.now() + 45000
+  const deadline = Date.now() + 120000
   while (!done && Date.now() < deadline) {
     await new Promise(r => setTimeout(r, 500))
   }
@@ -53,7 +53,7 @@ async function tryConnect(sessionString) {
   if (!done) {
     console.log('Worker: start() timeout, destroying')
     try { await client.destroy() } catch (_) {}
-    await Promise.race([startPromise.catch(() => {}), new Promise(r => setTimeout(r, 5000))])
+    await Promise.race([startPromise.catch(() => {}), new Promise(r => setTimeout(r, 15000))])
     return null
   }
   try { await startPromise; return client } catch (err) { try { await client.destroy() } catch (_) {}; throw err }
