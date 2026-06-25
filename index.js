@@ -27,10 +27,7 @@ function loadSession() {
 
 async function supaFetch(path) {
   const r = await fetch(`${SUPA_URL}/rest/v1/${path}`, {
-    headers: {
-      'apikey': SUPA_KEY,
-      'Authorization': `Bearer ${SUPA_KEY}`,
-    },
+    headers: { 'apikey': SUPA_KEY, 'Authorization': `Bearer ${SUPA_KEY}` },
   })
   return r.json()
 }
@@ -75,17 +72,14 @@ async function getOwnerAndSettings() {
   const profiles = await supaFetch(`profiles?select=id&telegram_user_id=eq.${TG_USER_ID}&limit=1`)
   const ownerID = profiles[0]?.id
   if (!ownerID) return null
-
   const [sourcesData, modelsData] = await Promise.all([
     supaFetch(`sources?select=url&owner_id=eq.${ownerID}&source_type=eq.telegram_channel&monitor_enabled=eq.true`),
     supaFetch(`equipment_models?select=model_name&owner_id=eq.${ownerID}&active=eq.true`),
   ])
-
   const groups = Array.isArray(sourcesData)
     ? sourcesData.map(s => s.url.replace('https://t.me/', '').replace('https://telegram.me/', '')).filter(Boolean)
     : []
   const models = Array.isArray(modelsData) ? modelsData.map(m => m.model_name.toLowerCase()) : []
-
   return { ownerID, groups, models }
 }
 
@@ -142,8 +136,31 @@ function startHttpServer(getClient) {
   })
 
   server.listen(PORT, () => {
-    console.log(`🌐 HTTP сервер запущен на порту ${PORT}`)
+    console.log(`HTTP server started on port ${PORT}`)
   })
+}
+
+async function connectTelegram(client) {
+  for (let attempt = 1; attempt <= 10; attempt++) {
+    try {
+      await client.start({
+        phoneNumber: async () => YOUR_PHONE,
+        password: async () => await input.text('2FA password: '),
+        phoneCode: async () => await input.text('Phone code: '),
+        onError: (err) => console.log('TG error:', err.message),
+      })
+      console.log('Telegram connected')
+      return true
+    } catch (err) {
+      console.error(`Connect attempt ${attempt}/10: ${err.message}`)
+      if (attempt < 10) {
+        const delay = attempt <= 3 ? 10000 : 30000
+        console.log(`Retry in ${delay / 1000}s...`)
+        await new Promise(r => setTimeout(r, delay))
+      }
+    }
+  }
+  return false
 }
 
 async function main() {
@@ -156,30 +173,27 @@ async function main() {
   )
 
   let connectedClient = null
-
-  // Сервер стартует сразу — не ждёт подключения к Telegram
   startHttpServer(() => connectedClient)
 
-  await client.start({
-    phoneNumber: async () => YOUR_PHONE,
-    password: async () => await input.text('Введи пароль 2FA: '),
-    phoneCode: async () => await input.text('Введи код из Telegram: '),
-    onError: (err) => console.log('Ошибка:', err),
-  })
+  const ok = await connectTelegram(client)
+  if (!ok) {
+    console.error('Failed to connect to Telegram. HTTP server stays alive.')
+    return
+  }
 
-  const session = client.session.save()
-  fs.writeFileSync(SESSION_FILE, session)
-  console.log('✅ Авторизован! Сессия сохранена.')
+  try {
+    const session = client.session.save()
+    fs.writeFileSync(SESSION_FILE, session)
+  } catch (_) {}
 
   connectedClient = client
 
   let settings = await getOwnerAndSettings()
-  console.log(`👁 Мониторинг запущен... Групп: ${settings?.groups?.length ?? 0}, Моделей: ${settings?.models?.length ?? 0}`)
+  console.log(`Monitoring: groups=${settings?.groups?.length ?? 0}, models=${settings?.models?.length ?? 0}`)
   sendNotification(`✅ Мониторинг запущен.\nГрупп: ${settings?.groups?.length ?? 0}, Моделей: ${settings?.models?.length ?? 0}`)
 
   setInterval(async () => {
     settings = await getOwnerAndSettings()
-    console.log(`[refresh] Групп: ${settings?.groups?.length ?? 0}, Моделей: ${settings?.models?.length ?? 0}`)
   }, 5 * 60 * 1000)
 
   client.addEventHandler(async (event) => {
@@ -189,14 +203,12 @@ async function main() {
     const lower = text.toLowerCase()
     const models = settings?.models ?? []
     if (models.length === 0) return
-    const matched = models.some(m => lower.includes(m))
-    if (!matched) return
+    if (!models.some(m => lower.includes(m))) return
     try {
       const sender = await message.getSender()
       const chat = await message.getChat()
       const username = sender?.username ? `@${sender.username}` : sender?.firstName ?? 'неизвестен'
       const chatTitle = chat?.title ?? 'группа'
-      console.log(`[${new Date().toLocaleTimeString()}] Найдено: ${username} в ${chatTitle}`)
       let leadId = null
       if (settings?.ownerID) {
         const lead = await createLead(
@@ -207,20 +219,17 @@ async function main() {
         )
         leadId = lead?.id?.slice(0, 8)
       }
-      const notification =
-        `🔔 <b>Новый продавец майнера!</b>\n\n` +
-        `👤 ${username}\n` +
-        `💬 ${chatTitle}\n\n` +
-        `📝 ${text.slice(0, 400)}\n\n` +
+      sendNotification(
+        `🔔 <b>Новый продавец майнера!</b>\n\n👤 ${username}\n💬 ${chatTitle}\n\n📝 ${text.slice(0, 400)}\n\n` +
         (leadId ? `✅ Лид создан: /черновик ${leadId}` : '')
-      sendNotification(notification)
+      )
     } catch (e) {
-      console.error('Ошибка обработки:', e.message)
+      console.error('Handler error:', e.message)
     }
   }, new NewMessage({}))
 
-  process.on('SIGINT', () => { console.log('\nОстановлен.'); process.exit() })
+  process.on('SIGINT', () => process.exit())
   await new Promise(() => {})
 }
 
-main().catch(console.error)
+main().catch(e => console.error('Fatal:', e.message))
