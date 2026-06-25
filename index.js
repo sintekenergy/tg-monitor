@@ -44,19 +44,14 @@ function sendNotification(text) {
 
 async function createLead(ownerID, displayName, telegramUsername, equipmentDescription) {
   const body = JSON.stringify({
-    owner_id: ownerID,
-    display_name: displayName.slice(0, 120),
+    owner_id: ownerID, display_name: displayName.slice(0, 120),
     telegram_username: telegramUsername || null,
     equipment_description: equipmentDescription?.slice(0, 500) || null,
-    status: 'new',
-    external_profile: 'auto-monitor',
+    status: 'new', external_profile: 'auto-monitor',
   })
   const r = await fetch(`${SUPA_URL}/rest/v1/leads`, {
     method: 'POST',
-    headers: {
-      'apikey': SUPA_KEY, 'Authorization': `Bearer ${SUPA_KEY}`,
-      'Content-Type': 'application/json', 'Prefer': 'return=representation',
-    },
+    headers: { 'apikey': SUPA_KEY, 'Authorization': `Bearer ${SUPA_KEY}`, 'Content-Type': 'application/json', 'Prefer': 'return=representation' },
     body,
   })
   const data = await r.json()
@@ -86,20 +81,14 @@ function startHttpServer(getClient) {
     res.setHeader('Content-Type', 'application/json')
     if (req.method === 'GET' && req.url === '/health') {
       res.writeHead(200)
-      return res.end(JSON.stringify({ ok: true }))
+      return res.end(JSON.stringify({ ok: true, tg: !!getClient() }))
     }
     const auth = req.headers['authorization']
-    if (auth !== `Bearer ${SECRET}`) {
-      res.writeHead(401)
-      return res.end(JSON.stringify({ error: 'Unauthorized' }))
-    }
+    if (auth !== `Bearer ${SECRET}`) { res.writeHead(401); return res.end(JSON.stringify({ error: 'Unauthorized' })) }
     const match = req.url.match(/^\/messages\/([A-Za-z0-9_]+)(\?.*)?$/)
     if (req.method === 'GET' && match) {
       const client = getClient()
-      if (!client) {
-        res.writeHead(503)
-        return res.end(JSON.stringify({ error: 'Client not ready' }))
-      }
+      if (!client) { res.writeHead(503); return res.end(JSON.stringify({ error: 'Client not ready' })) }
       const username = match[1]
       const limitMatch = (req.url || '').match(/limit=(\d+)/)
       const limit = Math.min(parseInt(limitMatch?.[1] || '15', 10), 30)
@@ -111,41 +100,64 @@ function startHttpServer(getClient) {
           has_video: !!(m.media && (m.media.className === 'MessageMediaDocument' || m.media.className === 'MessageMediaVideo')),
           url: `https://t.me/${username}/${m.id}`,
         }))
-        res.writeHead(200)
-        return res.end(JSON.stringify({ messages: result }))
-      } catch (e) {
-        res.writeHead(500)
-        return res.end(JSON.stringify({ error: e.message }))
-      }
+        res.writeHead(200); return res.end(JSON.stringify({ messages: result }))
+      } catch (e) { res.writeHead(500); return res.end(JSON.stringify({ error: e.message })) }
     }
-    res.writeHead(404)
-    res.end(JSON.stringify({ error: 'Not found' }))
+    res.writeHead(404); res.end(JSON.stringify({ error: 'Not found' }))
   })
   server.listen(PORT, () => console.log(`HTTP server on port ${PORT}`))
 }
 
+async function tryConnect(sessionString) {
+  const client = new TelegramClient(new StringSession(sessionString), API_ID, API_HASH, { connectionRetries: 1 })
+  let done = false
+  const startPromise = client.start({
+    phoneNumber: async () => YOUR_PHONE,
+    password: async () => await input.text('2FA: '),
+    phoneCode: async () => await input.text('Code: '),
+    onError: (err) => console.log('TG error:', err.message),
+  }).then(v => { done = true; return v }).catch(e => { done = true; throw e })
+
+  // Wait up to 45s for start() to resolve
+  const TIMEOUT = 45000
+  const deadline = Date.now() + TIMEOUT
+  while (!done && Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 1000))
+  }
+
+  if (!done) {
+    console.log('start() did not settle in 45s, destroying...')
+    try { await client.destroy() } catch (_) {}
+    // Wait for the hung promise to eventually settle (up to 10s)
+    await Promise.race([startPromise.catch(() => {}), new Promise(r => setTimeout(r, 10000))])
+    return null
+  }
+
+  try {
+    await startPromise
+    return client
+  } catch (err) {
+    try { await client.destroy() } catch (_) {}
+    throw err
+  }
+}
+
 async function connectTelegram(sessionString) {
   for (let attempt = 1; ; attempt++) {
-    const client = new TelegramClient(
-      new StringSession(sessionString), API_ID, API_HASH, { connectionRetries: 1 }
-    )
+    console.log(`Connect attempt ${attempt}...`)
     try {
-      const started = client.start({
-        phoneNumber: async () => YOUR_PHONE,
-        password: async () => await input.text('2FA: '),
-        phoneCode: async () => await input.text('Code: '),
-        onError: (err) => console.log('TG error:', err.message),
-      })
-      const timer = new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 40000))
-      await Promise.race([started, timer])
-      console.log(`Telegram connected on attempt ${attempt}`)
-      return client
+      const client = await tryConnect(sessionString)
+      if (client) {
+        console.log(`Telegram connected on attempt ${attempt}`)
+        return client
+      }
+      // Timeout case — wait before retry
     } catch (err) {
-      const delay = Math.min(20000 * attempt, 120000)
-      console.error(`Attempt ${attempt} failed: ${err.message}. Retry in ${delay / 1000}s`)
-      try { await client.destroy() } catch (_) {}
-      await new Promise(r => setTimeout(r, delay))
+      console.error(`Attempt ${attempt} error: ${err.message}`)
     }
+    const delay = Math.min(30000 * attempt, 180000)
+    console.log(`Waiting ${delay / 1000}s before retry...`)
+    await new Promise(r => setTimeout(r, delay))
   }
 }
 
@@ -153,10 +165,12 @@ async function main() {
   const sessionString = loadSession()
   const clientRef = { value: null }
   startHttpServer(() => clientRef.value)
+  console.log('HTTP server started, connecting to Telegram...')
 
   const client = await connectTelegram(sessionString)
   try { fs.writeFileSync(SESSION_FILE, client.session.save()) } catch (_) {}
   clientRef.value = client
+  console.log('clientRef set — messages endpoint now active')
 
   let settings = await getOwnerAndSettings()
   console.log(`Monitoring: groups=${settings?.groups?.length ?? 0}, models=${settings?.models?.length ?? 0}`)
@@ -178,18 +192,10 @@ async function main() {
       const chatTitle = chat?.title ?? 'group'
       let leadId = null
       if (settings?.ownerID) {
-        const lead = await createLead(
-          settings.ownerID,
-          sender?.username ?? sender?.firstName ?? 'unknown',
-          sender?.username ? `@${sender.username}` : null,
-          text.slice(0, 500)
-        )
+        const lead = await createLead(settings.ownerID, sender?.username ?? sender?.firstName ?? 'unknown', sender?.username ? `@${sender.username}` : null, text.slice(0, 500))
         leadId = lead?.id?.slice(0, 8)
       }
-      sendNotification(
-        `Новый продавец майнера!\n\n${username}\n${chatTitle}\n\n${text.slice(0, 400)}\n\n` +
-        (leadId ? `Лид создан: ${leadId}` : '')
-      )
+      sendNotification(`Новый продавец!\n\n${username}\n${chatTitle}\n\n${text.slice(0, 400)}\n` + (leadId ? `Лид: ${leadId}` : ''))
     } catch (e) { console.error('Handler error:', e.message) }
   }, new NewMessage({}))
 
