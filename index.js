@@ -89,13 +89,18 @@ async function getOwnerAndSettings() {
   return { ownerID, groups, models }
 }
 
-function startHttpServer(client) {
+function startHttpServer(getClient) {
   const PORT = process.env.PORT || 3001
   const SECRET = process.env.PREVIEW_SECRET || 'zemobmen-preview'
 
   const server = http.createServer(async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*')
     res.setHeader('Content-Type', 'application/json')
+
+    if (req.method === 'GET' && req.url === '/health') {
+      res.writeHead(200)
+      return res.end(JSON.stringify({ ok: true }))
+    }
 
     const auth = req.headers['authorization']
     if (auth !== `Bearer ${SECRET}`) {
@@ -105,10 +110,14 @@ function startHttpServer(client) {
 
     const match = req.url.match(/^\/messages\/([A-Za-z0-9_]+)(\?.*)?$/)
     if (req.method === 'GET' && match) {
+      const client = getClient()
+      if (!client) {
+        res.writeHead(503)
+        return res.end(JSON.stringify({ error: 'Client not ready' }))
+      }
       const username = match[1]
       const limitMatch = (req.url || '').match(/limit=(\d+)/)
       const limit = Math.min(parseInt(limitMatch?.[1] || '15', 10), 30)
-
       try {
         const msgs = await client.getMessages(username, { limit })
         const result = msgs.map(m => ({
@@ -128,11 +137,6 @@ function startHttpServer(client) {
       }
     }
 
-    if (req.method === 'GET' && req.url === '/health') {
-      res.writeHead(200)
-      return res.end(JSON.stringify({ ok: true }))
-    }
-
     res.writeHead(404)
     res.end(JSON.stringify({ error: 'Not found' }))
   })
@@ -144,7 +148,6 @@ function startHttpServer(client) {
 
 async function main() {
   const sessionString = loadSession()
-
   const client = new TelegramClient(
     new StringSession(sessionString),
     API_ID,
@@ -152,9 +155,14 @@ async function main() {
     { connectionRetries: 5 }
   )
 
+  let connectedClient = null
+
+  // Сервер стартует сразу — не ждёт подключения к Telegram
+  startHttpServer(() => connectedClient)
+
   await client.start({
     phoneNumber: async () => YOUR_PHONE,
-    password: async () => await input.text('Введи пароль 2FA (если есть, иначе Enter): '),
+    password: async () => await input.text('Введи пароль 2FA: '),
     phoneCode: async () => await input.text('Введи код из Telegram: '),
     onError: (err) => console.log('Ошибка:', err),
   })
@@ -163,7 +171,7 @@ async function main() {
   fs.writeFileSync(SESSION_FILE, session)
   console.log('✅ Авторизован! Сессия сохранена.')
 
-  startHttpServer(client)
+  connectedClient = client
 
   let settings = await getOwnerAndSettings()
   console.log(`👁 Мониторинг запущен... Групп: ${settings?.groups?.length ?? 0}, Моделей: ${settings?.models?.length ?? 0}`)
@@ -177,23 +185,18 @@ async function main() {
   client.addEventHandler(async (event) => {
     const message = event.message
     if (!message?.text) return
-
     const text = message.text
     const lower = text.toLowerCase()
-
     const models = settings?.models ?? []
     if (models.length === 0) return
     const matched = models.some(m => lower.includes(m))
     if (!matched) return
-
     try {
       const sender = await message.getSender()
       const chat = await message.getChat()
       const username = sender?.username ? `@${sender.username}` : sender?.firstName ?? 'неизвестен'
       const chatTitle = chat?.title ?? 'группа'
-
       console.log(`[${new Date().toLocaleTimeString()}] Найдено: ${username} в ${chatTitle}`)
-
       let leadId = null
       if (settings?.ownerID) {
         const lead = await createLead(
@@ -204,14 +207,12 @@ async function main() {
         )
         leadId = lead?.id?.slice(0, 8)
       }
-
       const notification =
         `🔔 <b>Новый продавец майнера!</b>\n\n` +
         `👤 ${username}\n` +
         `💬 ${chatTitle}\n\n` +
         `📝 ${text.slice(0, 400)}\n\n` +
         (leadId ? `✅ Лид создан: /черновик ${leadId}` : '')
-
       sendNotification(notification)
     } catch (e) {
       console.error('Ошибка обработки:', e.message)
