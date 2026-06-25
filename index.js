@@ -141,7 +141,7 @@ function startHttpServer(getClient) {
 }
 
 async function connectTelegram(client) {
-  for (let attempt = 1; attempt <= 10; attempt++) {
+  for (let attempt = 1; ; attempt++) {
     try {
       await client.start({
         phoneNumber: async () => YOUR_PHONE,
@@ -149,19 +149,16 @@ async function connectTelegram(client) {
         phoneCode: async () => await input.text('Phone code: '),
         onError: (err) => console.log('TG error:', err.message),
       })
-      console.log('Telegram connected')
+      console.log('Telegram connected on attempt', attempt)
       return true
     } catch (err) {
-      console.error(`Connect attempt ${attempt}/10: ${err.message}`)
-      if (attempt < 10) {
-        const delay = attempt <= 3 ? 10000 : 30000
-        console.log(`Retry in ${delay / 1000}s...`)
-        await new Promise(r => setTimeout(r, delay))
-      }
+      const delay = Math.min(15000 * attempt, 120000)
+      console.error(`Attempt ${attempt} failed: ${err.message}. Retry in ${delay / 1000}s`)
+      await new Promise(r => setTimeout(r, delay))
     }
   }
-  return false
 }
+
 
 async function main() {
   const sessionString = loadSession()
