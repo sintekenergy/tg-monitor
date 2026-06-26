@@ -1,6 +1,5 @@
 const http = require('http')
 const https = require('https')
-const fs = require('fs')
 const { Worker } = require('worker_threads')
 const path = require('path')
 
@@ -15,22 +14,39 @@ const SECRET = process.env.PREVIEW_SECRET || 'zemobmen-preview'
 let tgReady = false
 let pendingRequests = new Map()
 let msgId = 0
+let worker = null
 
-const worker = new Worker(path.join(__dirname, 'tg-worker.js'))
-worker.on('message', (msg) => {
-  if (msg.type === 'connected') { tgReady = true; console.log('Main: TG worker connected'); sendNotification('Мониторинг запущен') }
-  if (msg.type === 'getMessages') {
-    const cb = pendingRequests.get(msg.id)
-    if (cb) { pendingRequests.delete(msg.id); cb(msg) }
-  }
-  if (msg.type === 'newMessage') { handleNewMessage(msg).catch(e => console.error('newMsg error:', e.message)) }
-})
-worker.on('error', e => console.error('Worker error:', e.message))
-worker.on('exit', code => { console.log('Worker exited with code', code); tgReady = false })
+function startWorker() {
+  console.log('Starting TG worker...')
+  worker = new Worker(path.join(__dirname, 'tg-worker.js'))
+  worker.on('message', (msg) => {
+    if (msg.type === 'connected') {
+      tgReady = true
+      console.log('Main: TG worker connected!')
+      sendNotification('Мониторинг запущен')
+    }
+    if (msg.type === 'getMessages') {
+      const cb = pendingRequests.get(msg.id)
+      if (cb) { pendingRequests.delete(msg.id); cb(msg) }
+    }
+    if (msg.type === 'newMessage') {
+      handleNewMessage(msg).catch(e => console.error('newMsg error:', e.message))
+    }
+  })
+  worker.on('error', e => console.error('Worker error:', e.message))
+  worker.on('exit', code => {
+    console.log('Worker exited with code', code, '— restarting in 10s...')
+    tgReady = false
+    // Cancel pending requests
+    for (const [id, cb] of pendingRequests) { cb({ id, error: 'worker_restart' }) }
+    pendingRequests.clear()
+    setTimeout(startWorker, 10000)
+  })
+}
 
 function getMessages(username, limit) {
   return new Promise((resolve, reject) => {
-    if (!tgReady) { reject(new Error('not_ready')); return }
+    if (!tgReady || !worker) { reject(new Error('not_ready')); return }
     const id = ++msgId
     const timer = setTimeout(() => { pendingRequests.delete(id); reject(new Error('timeout')) }, 15000)
     pendingRequests.set(id, (msg) => {
@@ -53,8 +69,8 @@ function sendNotification(text) {
   req.on('error', () => {}); req.write(body); req.end()
 }
 
-async function supaFetch(path) {
-  const r = await fetch(`${SUPA_URL}/rest/v1/${path}`, {
+async function supaFetch(p) {
+  const r = await fetch(`${SUPA_URL}/rest/v1/${p}`, {
     headers: { 'apikey': SUPA_KEY, 'Authorization': `Bearer ${SUPA_KEY}` },
   })
   return r.json()
@@ -66,14 +82,14 @@ async function refreshSettings() {
     const profiles = await supaFetch(`profiles?select=id&telegram_user_id=eq.${TG_USER_ID}&limit=1`)
     const ownerID = profiles[0]?.id
     if (!ownerID) { settings = null; return }
-    const [sourcesData, modelsData] = await Promise.all([
+    const [s, m] = await Promise.all([
       supaFetch(`sources?select=url&owner_id=eq.${ownerID}&source_type=eq.telegram_channel&monitor_enabled=eq.true`),
       supaFetch(`equipment_models?select=model_name&owner_id=eq.${ownerID}&active=eq.true`),
     ])
     settings = {
       ownerID,
-      groups: Array.isArray(sourcesData) ? sourcesData.map(s => s.url.replace('https://t.me/','').replace('https://telegram.me/','')).filter(Boolean) : [],
-      models: Array.isArray(modelsData) ? modelsData.map(m => m.model_name.toLowerCase()) : [],
+      groups: Array.isArray(s) ? s.map(x => x.url.replace('https://t.me/','').replace('https://telegram.me/','')).filter(Boolean) : [],
+      models: Array.isArray(m) ? m.map(x => x.model_name.toLowerCase()) : [],
     }
   } catch (e) { console.error('refreshSettings error:', e.message) }
 }
@@ -83,14 +99,10 @@ async function handleNewMessage({ text, senderId }) {
   const lower = text.toLowerCase()
   if (!settings.models.length || !settings.models.some(m => lower.includes(m))) return
   try {
-    const body = JSON.stringify({
-      owner_id: settings.ownerID, display_name: senderId, telegram_username: null,
-      equipment_description: text.slice(0, 500), status: 'new', external_profile: 'auto-monitor',
-    })
     await fetch(`${SUPA_URL}/rest/v1/leads`, {
       method: 'POST',
       headers: { 'apikey': SUPA_KEY, 'Authorization': `Bearer ${SUPA_KEY}`, 'Content-Type': 'application/json', 'Prefer': 'return=representation' },
-      body,
+      body: JSON.stringify({ owner_id: settings.ownerID, display_name: senderId, telegram_username: null, equipment_description: text.slice(0, 500), status: 'new', external_profile: 'auto-monitor' }),
     })
     sendNotification(`Новый продавец!\n\n${text.slice(0, 400)}`)
   } catch (e) { console.error('handleNewMessage error:', e.message) }
@@ -99,43 +111,32 @@ async function handleNewMessage({ text, senderId }) {
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*')
   res.setHeader('Content-Type', 'application/json')
-
   if (req.url === '/health') {
     res.writeHead(200)
     return res.end(JSON.stringify({ ok: true, tg: tgReady }))
   }
-
   const auth = req.headers['authorization']
-  if (auth !== `Bearer ${SECRET}`) {
-    res.writeHead(401)
-    return res.end(JSON.stringify({ error: 'Unauthorized' }))
-  }
-
+  if (auth !== `Bearer ${SECRET}`) { res.writeHead(401); return res.end(JSON.stringify({ error: 'Unauthorized' })) }
   const match = req.url && req.url.match(/^\/messages\/([A-Za-z0-9_]+)/)
   if (req.method === 'GET' && match) {
-    if (!tgReady) {
-      res.writeHead(503)
-      return res.end(JSON.stringify({ error: 'Client not ready' }))
-    }
+    if (!tgReady) { res.writeHead(503); return res.end(JSON.stringify({ error: 'Client not ready' })) }
     const username = match[1]
-    const limitMatch = req.url.match(/limit=(\d+)/)
-    const limit = Math.min(parseInt(limitMatch ? limitMatch[1] : '15', 10), 30)
+    const lm = req.url.match(/limit=(\d+)/)
+    const limit = Math.min(parseInt(lm ? lm[1] : '15', 10), 30)
     getMessages(username, limit).then(messages => {
-      res.writeHead(200)
-      res.end(JSON.stringify({ messages }))
+      res.writeHead(200); res.end(JSON.stringify({ messages }))
     }).catch(e => {
       res.writeHead(e.message === 'Client not ready' ? 503 : 500)
       res.end(JSON.stringify({ error: e.message }))
     })
     return
   }
-
-  res.writeHead(404)
-  res.end(JSON.stringify({ error: 'Not found' }))
+  res.writeHead(404); res.end(JSON.stringify({ error: 'Not found' }))
 })
 
 server.listen(PORT, () => {
   console.log(`HTTP server on port ${PORT}`)
-  refreshSettings().catch(e => console.error('init settings error:', e.message))
-  setInterval(() => refreshSettings().catch(e => console.error('refresh settings error:', e.message)), 5 * 60 * 1000)
+  startWorker()
+  refreshSettings().catch(e => console.error('init settings:', e.message))
+  setInterval(() => refreshSettings().catch(e => console.error('refresh:', e.message)), 5 * 60 * 1000)
 })
